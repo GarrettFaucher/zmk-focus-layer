@@ -1,0 +1,13 @@
+[Unit]
+Description=ZMK focus layer (Scroll Lock follows focused game window)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=dev.garrettfaucher.ZmkFocusLayer
+ExecStart=%h/.local/bin/zmk-focus-layer
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target

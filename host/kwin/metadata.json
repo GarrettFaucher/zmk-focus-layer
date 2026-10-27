@@ -1,0 +1,14 @@
+{
+    "KPlugin": {
+        "Id": "zmkfocuslayer",
+        "Name": "ZMK Focus Layer",
+        "Description": "Reports the active window to zmk-focus-layer",
+        "Authors": [{ "Name": "Garrett Faucher" }],
+        "License": "MIT",
+        "Version": "1.0",
+        "EnabledByDefault": false
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js",
+    "KPackageStructure": "KWin/Script"
+}

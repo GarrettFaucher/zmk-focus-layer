@@ -1,0 +1,17 @@
+config ZMK_FOCUS_LAYER
+    bool "Activate a keymap layer while a host lock LED is lit"
+    depends on !ZMK_SPLIT || ZMK_SPLIT_ROLE_CENTRAL
+    select ZMK_HID_INDICATORS
+
+if ZMK_FOCUS_LAYER
+
+config ZMK_FOCUS_LAYER_LAYER
+    int "Layer ID driven by the LED"
+    default 1
+
+config ZMK_FOCUS_LAYER_INDICATOR_BIT
+    int "HID LED bit (0 Num, 1 Caps, 2 Scroll, 3 Compose, 4 Kana)"
+    range 0 7
+    default 2
+
+endif

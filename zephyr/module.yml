@@ -1,0 +1,4 @@
+name: zmk-focus-layer
+build:
+  cmake: .
+  kconfig: Kconfig

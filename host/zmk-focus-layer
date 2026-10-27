@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Light Scroll Lock while the focused window belongs to a GameMode game.
+
+A KWin script reports every focus change over D-Bus. When the focused
+window's process (or one of its ancestors) is registered with GameMode, this
+daemon turns Scroll Lock on by injecting KEY_SCROLLLOCK through a uinput
+keyboard. KWin then sets the Scroll Lock LED on every keyboard, and the
+zmk-focus-layer firmware module follows that LED with a keymap layer.
+"""
+
+import signal
+import sys
+
+import evdev
+from evdev import ecodes
+from gi.repository import Gio, GLib
+
+BUS_NAME = "dev.garrettfaucher.ZmkFocusLayer"
+OBJECT_PATH = "/dev/garrettfaucher/ZmkFocusLayer"
+INTERFACE = "dev.garrettfaucher.ZmkFocusLayer"
+
+GAMEMODE_NAME = "com.feralinteractive.GameMode"
+GAMEMODE_PATH = "/com/feralinteractive/GameMode"
+GAMEMODE_INTERFACE = "com.feralinteractive.GameMode"
+
+INTROSPECTION = f"""
+<node>
+  <interface name="{INTERFACE}">
+    <method name="ActiveWindowChanged">
+      <arg type="s" name="pid" direction="in"/>
+      <arg type="s" name="resource_class" direction="in"/>
+    </method>
+  </interface>
+</node>
+"""
+
+APPLY_DELAY_MS = 150
+MAX_ANCESTRY = 64
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def parent_pid(pid):
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            stat = f.read()
+    except OSError:
+        return 0
+    # Field 2 (comm) may contain spaces and parentheses; ppid is the second
+    # field after the last ')'.
+    return int(stat[stat.rindex(b")") + 2 :].split()[1])
+
+
+class FocusLayer:
+    def __init__(self, loop):
+        self.loop = loop
+        self.focused_pid = 0
+        self.focused_class = ""
+        self.desired = False
+        self.pending = None
+        self.gamemode_error = False
+        self.exit_code = 0
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.gamemode = Gio.DBusProxy.new_sync(
+            self.bus,
+            Gio.DBusProxyFlags.DO_NOT_AUTO_START
+            | Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES
+            | Gio.DBusProxyFlags.DO_NOT_CONNECT_SIGNALS,
+            None,
+            GAMEMODE_NAME,
+            GAMEMODE_PATH,
+            GAMEMODE_INTERFACE,
+            None,
+        )
+        # The full key range makes udev tag the device ID_INPUT_KEYBOARD, so
+        # KWin treats it as a keyboard and pushes LED state to it. Only
+        # KEY_SCROLLLOCK is ever emitted.
+        self.ui = evdev.UInput(
+            {
+                ecodes.EV_KEY: list(range(ecodes.KEY_ESC, ecodes.KEY_MICMUTE + 1)),
+                ecodes.EV_LED: [ecodes.LED_NUML, ecodes.LED_CAPSL, ecodes.LED_SCROLLL],
+            },
+            name="zmk-focus-layer",
+        )
+        for member in ("GameRegistered", "GameUnregistered"):
+            self.bus.signal_subscribe(
+                None,
+                GAMEMODE_INTERFACE,
+                member,
+                GAMEMODE_PATH,
+                None,
+                Gio.DBusSignalFlags.NONE,
+                self.on_gamemode_signal,
+            )
+        node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION)
+        self.bus.register_object(OBJECT_PATH, node.interfaces[0], self.on_method_call, None, None)
+        Gio.bus_own_name_on_connection(
+            self.bus, BUS_NAME, Gio.BusNameOwnerFlags.DO_NOT_QUEUE, None, self.on_name_lost
+        )
+        # Clear a Scroll Lock left lit by a previous crash once KWin has had
+        # time to pick up the new device.
+        GLib.timeout_add(500, self.apply)
+
+    def on_name_lost(self, _connection, name):
+        log(f"bus name {name} is already owned; another instance is running")
+        # Leave Scroll Lock to the running instance.
+        self.exit_code = 1
+        self.ui.close()
+        self.loop.quit()
+
+    def on_method_call(self, _conn, _sender, _path, _iface, method, params, invocation):
+        if method != "ActiveWindowChanged":
+            invocation.return_dbus_error(
+                "org.freedesktop.DBus.Error.UnknownMethod", f"unknown method {method}"
+            )
+            return
+        pid, resource_class = params.unpack()
+        try:
+            pid = int(pid)
+        except ValueError:
+            pid = 0
+        self.focused_pid = pid if pid > 0 else 0
+        self.focused_class = resource_class if self.focused_pid else ""
+        invocation.return_value(None)
+        self.refresh()
+
+    def on_gamemode_signal(self, *_args):
+        self.refresh()
+
+    def game_pids(self):
+        try:
+            result = self.gamemode.call_sync("ListGames", None, Gio.DBusCallFlags.NONE, 1000, None)
+        except GLib.Error as err:
+            if not self.gamemode_error:
+                log(f"GameMode ListGames failed: {err.message}")
+                self.gamemode_error = True
+            return set()
+        self.gamemode_error = False
+        return {pid for pid, _path in result.unpack()[0]}
+
+    def is_game(self, pid):
+        if pid <= 0:
+            return False
+        games = self.game_pids()
+        if not games:
+            return False
+        for _ in range(MAX_ANCESTRY):
+            if pid in games:
+                return True
+            pid = parent_pid(pid)
+            if pid <= 1:
+                return False
+        return False
+
+    def refresh(self):
+        self.desired = self.is_game(self.focused_pid)
+        if self.pending is not None:
+            GLib.source_remove(self.pending)
+        self.pending = GLib.timeout_add(APPLY_DELAY_MS, self.apply)
+
+    def apply(self):
+        self.pending = None
+        lit = ecodes.LED_SCROLLL in self.ui.device.leds()
+        if lit != self.desired:
+            self.ui.write(ecodes.EV_KEY, ecodes.KEY_SCROLLLOCK, 1)
+            self.ui.syn()
+            self.ui.write(ecodes.EV_KEY, ecodes.KEY_SCROLLLOCK, 0)
+            self.ui.syn()
+            if self.desired:
+                log(f"game layer on (pid {self.focused_pid}, class {self.focused_class})")
+            else:
+                log("game layer off")
+        return False
+
+    def shutdown(self):
+        if self.pending is not None:
+            GLib.source_remove(self.pending)
+        self.desired = False
+        self.apply()
+        self.ui.close()
+        self.loop.quit()
+        return False
+
+
+def main():
+    loop = GLib.MainLoop()
+    try:
+        daemon = FocusLayer(loop)
+    except (OSError, GLib.Error) as err:
+        log(f"startup failed: {err}")
+        return 1
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, daemon.shutdown)
+    loop.run()
+    return daemon.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
