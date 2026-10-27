@@ -12,8 +12,11 @@ import signal
 import sys
 
 import evdev
+import gi
 from evdev import ecodes
-from gi.repository import Gio, GLib
+
+gi.require_version("GLibUnix", "2.0")
+from gi.repository import Gio, GLib, GLibUnix  # noqa: E402
 
 BUS_NAME = "dev.garrettfaucher.ZmkFocusLayer"
 OBJECT_PATH = "/dev/garrettfaucher/ZmkFocusLayer"
@@ -192,7 +195,7 @@ def main():
         log(f"startup failed: {err}")
         return 1
     for sig in (signal.SIGTERM, signal.SIGINT):
-        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, daemon.shutdown)
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, sig, daemon.shutdown)
     loop.run()
     return daemon.exit_code
 
